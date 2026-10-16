@@ -116,7 +116,8 @@ Module Parse(std::span<const std::uint32_t> words) {
         } else if (op == spv::OpEntryPoint) {
             module.entry = operand(1);
         } else if (op == spv::OpVariable && function == 0u && operand(2) == spv::StorageClassPrivate) {
-            module.privates.insert(operand(1));
+            const auto name = module.names.find(operand(1));
+            if (name == module.names.end() || !name->second.starts_with("bda_fault_")) module.privates.insert(operand(1));
         } else if (op == spv::OpFunction) {
             function = operand(1);
             module.controls[function] = operand(2);

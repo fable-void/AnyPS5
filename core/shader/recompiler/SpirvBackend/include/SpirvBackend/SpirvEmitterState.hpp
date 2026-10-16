@@ -131,6 +131,7 @@ struct SpirvEmitterState {
     bool registrationModules = false;
     bool fragmentDescriptorSet = false;
     bool float16DenormPreserve = false;
+    bool bdaRangeList = true;
     std::unordered_set<const IrValue*> sharedLaneValues;
     std::uint32_t laneHalf = 0;
     std::uint32_t spirvVersion = 0x00010300u;
@@ -147,12 +148,14 @@ struct SpirvEmitterState {
     std::uint32_t bdaPagetableVariable = 0;
     std::uint32_t faultBufferVariable = 0;
     std::uint32_t bdaTranslateFunction = 0;
+    std::uint32_t bdaWriteTranslateFunction = 0;
     std::uint32_t bdaSegmentFunction = 0;
     std::array<std::uint32_t, 3> bdaReadCache {};
     std::array<std::uint32_t, 3> bdaVectorCache {};
+    std::array<std::uint32_t, 3> bdaTableVariables {};
+    std::array<std::uint32_t, 2> bdaComponentReadFunctions {};
+    std::uint32_t formatTableVariable = 0;
     std::uint32_t bdaPointerFunction = 0;
-    // The lookup without fault recording that wide reads try first (see EmitBdaDwordReads); 0 when
-    // every read takes the byte path.
     std::uint32_t bdaProbeFunction = 0;
     std::uint32_t bdaWritePointerFunction = 0;
     std::uint32_t bdaWriteProbeFunction = 0;
@@ -164,6 +167,7 @@ struct SpirvEmitterState {
     std::map<std::uint32_t, std::uint32_t> formatDecoders;
     std::map<std::uint32_t, std::uint32_t> formatEncoders;
     std::uint32_t bdaFaultFunction = 0;
+    std::array<std::uint32_t, 5> bdaFaultPending {};
     bool nativeF16ModesEmitted = false;
     bool f16DenormPreserveEmitted = false;
     std::uint32_t dot2F32F16Function = 0;

@@ -7,7 +7,9 @@
 #include <vector>
 
 std::vector<std::uint32_t> MakeBdaTranslateTestShader(std::uint32_t count);
+std::vector<std::uint32_t> MakeBdaSegmentTestShader(std::uint32_t count);
 std::vector<std::uint32_t> MakeBdaTestShader(std::uint64_t address, std::uint32_t bits, std::int64_t offset = 0);
+std::vector<std::uint32_t> MakeBdaHeldFaultTestShader(std::uint64_t heldAddress, std::uint32_t heldBytes, std::uint32_t heldPc, std::uint64_t address, std::uint32_t bits);
 std::vector<std::uint32_t> MakeBdaDwordReadTestShader(std::uint64_t address, std::uint32_t dwords, bool coherent, bool stops);
 std::vector<std::uint32_t> MakeBdaSpanReadTestShader(std::uint64_t address, std::uint32_t offset, std::uint32_t extracted, bool coherent, bool stops);
 struct BdaCachedRead {

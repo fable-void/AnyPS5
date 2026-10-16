@@ -754,7 +754,7 @@ std::string RequestSerializer::Serialize(const RecompileRequest& request) const 
     std::string buffer;
     Writer writer(buffer);
     writer.WriteU32(0x41505335u);
-    writer.WriteU32(26u);
+    writer.WriteU32(27u);
     writeShaderBinary(writer, request.shader);
     writeGuestContext(writer, request.context);
     writeSpirvTarget(writer, request.target);
@@ -781,6 +781,7 @@ std::string RequestSerializer::Serialize(const RecompileRequest& request) const 
     writer.WriteU32Span(request.shader.linkedLiterals);
     writer.WriteU32Span(request.context.linkedWords);
     if (request.context.compute.has_value()) writer.WriteBool(request.context.compute->threadsFromMemory);
+    writer.WriteBool(request.target.bdaRangeList);
     return base64Encode(buffer);
 }
 
@@ -789,7 +790,7 @@ DeserializedRequest RequestSerializer::Deserialize(std::string_view text) const 
     Reader reader(decoded);
     if (reader.ReadU32() != 0x41505335u) throw std::runtime_error("invalid recompile request signature");
     const auto version = reader.ReadU32();
-    if (version < 1u || version > 26u) throw std::runtime_error("unsupported recompile request serialization version");
+    if (version < 1u || version > 27u) throw std::runtime_error("unsupported recompile request serialization version");
     DeserializedRequest result{};
     result.request.shader = readShaderBinary(reader, result.shaderCode, result.shaderHeader);
     result.request.context = readGuestContext(reader, result, version);
@@ -821,6 +822,7 @@ DeserializedRequest RequestSerializer::Deserialize(std::string_view text) const 
         result.request.context.linkedWords = result.linkedWords;
     }
     if (version >= 26u && result.request.context.compute.has_value()) result.request.context.compute->threadsFromMemory = reader.ReadBool();
+    if (version >= 27u) result.request.target.bdaRangeList = reader.ReadBool();
     return result;
 }
 

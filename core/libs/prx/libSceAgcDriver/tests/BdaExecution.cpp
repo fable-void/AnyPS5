@@ -1,5 +1,6 @@
 #include "BdaShader.hpp"
 #include "BdaAbi.hpp"
+#include "SpirvBackend/SpirvBda.hpp"
 #include "IntermediateRepresentation/IrMetadata/ShaderStage.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/Resources.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/BdaPageTable.hpp"
@@ -321,6 +322,24 @@ static void RunBdaReadTests(const Context& context, bool paged) {
     run(guest, 8, 0, Abi::FaultReason::InvalidTable, 1);
     run(std::numeric_limits<std::uint64_t>::max() - 2, 8, 0, Abi::FaultReason::Overflow, 0, 1, 4);
     run(1, 8, 0, Abi::FaultReason::Overflow, 0, 1, -4);
+    const auto held = [&](const char* name, std::uint64_t address, std::uint32_t bits) {
+        const auto pages = PagesFor(context, paged, ranges);
+        const auto table = MakeBinding(context, paged, pages, ranges);
+        std::memset(fault.Bytes().data(), 0, fault.Bytes().size());
+        const std::uint32_t sentinel = 0xdeadbeef;
+        std::memcpy(output.Bytes().data(), &sentinel, sizeof(sentinel));
+        Pipeline pipeline(context, MakeBdaHeldFaultTestShader(guest + 0x40, 2, 0x5678, address, bits), {table.get(), &fault, &output});
+        pipeline.Run(1);
+        Abi::Fault report{};
+        std::uint32_t result = 0;
+        std::memcpy(&report, fault.Bytes().data(), sizeof(report));
+        std::memcpy(&result, output.Bytes().data(), sizeof(result));
+        const std::string label = std::string("a BDA ") + name + (paged ? " (paged) " : " ");
+        Require(report.state == Abi::FaultState::Ready && report.reason == Abi::FaultReason::Unmapped && report.address == guest + 0x40 && report.bytes == 2 && report.stage == static_cast<std::uint32_t>(ShaderRecompiler::IrShaderStage::Compute) && report.instruction == 0x5678 && report.reserved == 0, label + "that stopped its invocation published reason " + std::to_string(static_cast<std::uint32_t>(report.reason)) + " at guest + " + std::to_string(report.address - guest) + " bytes " + std::to_string(report.bytes) + " pc " + std::to_string(report.instruction) + ", expected the unmapped fault the invocation held before it");
+        Require(result == sentinel, label + "that stopped behind a held fault continued to output a value");
+    };
+    held("unmapped byte read", guest - 1, 8);
+    held("dword read past the top of memory", std::numeric_limits<std::uint64_t>::max() - 1, 32);
     Buffer words(context, 16, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT);
     const auto read = [&](std::uint64_t address, std::uint32_t dwords, bool coherent, bool stops, std::uint32_t value, bool faults) {
         const auto pages = PagesFor(context, paged, ranges);
@@ -360,9 +379,9 @@ static void RunBdaReadTests(const Context& context, bool paged) {
     }
     constexpr std::uint64_t spanGuest = 0x7fff56780000ULL;
     const std::array<Abi::Range, 3> spanRanges{{ranges[0], ranges[1], {spanGuest, spanGuest + 32, wide.DeviceAddress(), Abi::Read, 0}}};
-    const auto span = [&](std::uint64_t address, std::int32_t offset, std::uint32_t extracted, bool coherent, bool stops, std::array<std::uint32_t, 4> values, Abi::FaultReason reason = {}, std::uint64_t faultAddress = 0, std::uint32_t faultBytes = 0) {
+    const auto span = [&](std::uint64_t address, std::int32_t offset, std::uint32_t extracted, bool coherent, bool stops, std::array<std::uint32_t, 4> values, Abi::FaultReason reason = {}, std::uint64_t faultAddress = 0, std::uint32_t faultBytes = 0, std::uint32_t extraCount = 0) {
         const auto pages = PagesFor(context, paged, spanRanges);
-        const auto spanTable = MakeBinding(context, paged, pages, spanRanges);
+        const auto spanTable = MakeBinding(context, paged, pages, spanRanges, {}, extraCount);
         std::memset(fault.Bytes().data(), 0, fault.Bytes().size());
         const std::array<std::uint32_t, 4> sentinel{0xdeadbeef, 0xdeadbeef, 0xdeadbeef, 0xdeadbeef};
         std::memcpy(words.Bytes().data(), sentinel.data(), sizeof(sentinel));
@@ -390,6 +409,7 @@ static void RunBdaReadTests(const Context& context, bool paged) {
             span(spanGuest + 28, 0, 0b0101u, coherent, stops, {at(7), 0, 0, 0}, Abi::FaultReason::Unmapped, spanGuest + 36, 1);
             span(guest, 1, 0b1001u, coherent, stops, {0x55443322, 0, 0, 0}, Abi::FaultReason::Unmapped, guest + 13, 1);
             span(4, -8, 0b0001u, coherent, stops, {0, 0, 0, 0}, Abi::FaultReason::Overflow, 4, 0);
+            span(spanGuest, 0, 0b0001u, coherent, stops, {0, 0, 0, 0}, Abi::FaultReason::InvalidTable, spanGuest, 1, 1);
         }
     }
     ranges[0].permissions = 0;
@@ -430,6 +450,27 @@ static void RunBdaPageTableTests(const Context& context) {
         }
         return results;
     };
+    const auto segments = [&](std::span<const Abi::Range> own, std::uint64_t pageTable, std::span<const std::uint64_t> addresses) {
+        const auto root = MakeBinding(context, own, {}, pageTable);
+        const auto count = static_cast<std::uint32_t>(addresses.size());
+        Buffer io(context, std::size_t{count} * 8u * sizeof(std::uint32_t), VK_BUFFER_USAGE_STORAGE_BUFFER_BIT);
+        auto* words = reinterpret_cast<std::uint32_t*>(io.Bytes().data());
+        for (std::uint32_t index = 0; index < count; ++index) {
+            words[8u * index] = static_cast<std::uint32_t>(addresses[index]);
+            words[8u * index + 1u] = static_cast<std::uint32_t>(addresses[index] >> 32u);
+        }
+        std::memset(fault.Bytes().data(), 0, fault.Bytes().size());
+        Pipeline pipeline(context, MakeBdaSegmentTestShader(count), {root.get(), &fault, &io});
+        pipeline.Run((count + 63u) / 64u);
+        Abi::Fault report{};
+        std::memcpy(&report, fault.Bytes().data(), sizeof(report));
+        Require(report.state == Abi::FaultState::Empty, "a BDA segment lookup published a fault");
+        std::vector<std::array<std::uint64_t, 3>> results(count);
+        for (std::uint32_t index = 0; index < count; ++index) {
+            for (std::uint32_t field = 0; field < 3u; ++field) results[index][field] = words[8u * index + 2u + 2u * field] | (static_cast<std::uint64_t>(words[8u * index + 3u + 2u * field]) << 32u);
+        }
+        return results;
+    };
     const auto hex = [](std::uint64_t value) {
         char text[24];
         std::snprintf(text, sizeof(text), "0x%llx", static_cast<unsigned long long>(value));
@@ -463,6 +504,23 @@ static void RunBdaPageTableTests(const Context& context) {
         const auto alone = pages != nullptr ? translate({}, gpuGrants, pages->Address(), probes) : std::vector<Ref::Translation>{};
         const auto leaves = Ref::EncodeLeaves(held, [](std::uint32_t window, std::span<const Abi::Range> ranges) { return EncodeBdaWindow(window, ranges); });
         const Ref::Leaves none;
+        if (grants.empty() && !boundGiven && !ShaderRecompiler::BdaByteReadsForced()) {
+            std::vector<std::uint64_t> addresses;
+            for (const auto address : Ref::Probes(list)) {
+                if (address != ~std::uint64_t{0}) addresses.push_back(address);
+            }
+            const auto found = segments(own, PageTableAddress(pages), addresses);
+            for (std::size_t index = 0; index < addresses.size(); ++index) {
+                const auto address = addresses[index];
+                const auto begin = found[index][0];
+                const auto end = found[index][1];
+                const auto delta = found[index][2];
+                const auto expected = Ref::Translate(leaves, own, address, 1u, Abi::Read);
+                const auto mapsAt = [&](std::uint64_t at) { return Ref::Translate(leaves, own, at, 1u, Abi::Read) == Ref::Translation{at + delta, 0u}; };
+                const bool kept = expected.reason == 0u ? begin <= address && address < end && address + delta == expected.device && mapsAt(begin) && mapsAt(end - 1u) : begin == 0u && end == 0u && delta == expected.reason;
+                Require(kept, name + ": the GPU segment of " + hex(address) + " is [" + hex(begin) + ", " + hex(end) + ") with delta " + hex(delta) + ", its translation " + hex(expected.device) + " reason " + std::to_string(expected.reason));
+            }
+        }
         std::size_t differs = 0;
         for (std::size_t index = 0; index < probes.size(); ++index) {
             const auto& probe = probes[index];
@@ -555,7 +613,7 @@ static void RunBdaWrittenPageTests(const Context& context) {
         std::uint64_t active;
     };
     const auto bytesOf = [](BdaLaneStore store) { return store == BdaLaneStore::Byte ? 1u : store == BdaLaneStore::Short ? 2u : store == BdaLaneStore::Dwordx4 ? 16u : 4u; };
-    const std::array<Case, 10> cases{{
+    const std::array<Case, 13> cases{{
         {"unaligned dwords across pages, alternate lanes", BdaLaneStore::Dword, 0x1000u, 0xffeu, 0xaaaaaaaaaaaaaaaaull},
         {"unaligned runtime dwords across pages, other lanes", BdaLaneStore::RuntimeDword, 0x1000u, 0xffdu, 0x5555555555555555ull},
         {"dwordx4 across chunks, scattered lanes", BdaLaneStore::Dwordx4, 0x20000u, 0x1fff8u, 0x8421084210842108ull},
@@ -566,6 +624,9 @@ static void RunBdaWrittenPageTests(const Context& context) {
         {"atomics of all lanes", BdaLaneStore::Atomic, 0x3000u, 0x10u, ~0ull},
         {"one lane", BdaLaneStore::Dword, 0x20000u, 0x1fffeu, 1ull << 37u},
         {"no lane", BdaLaneStore::Dword, 0x1000u, 0xffeu, 0ull},
+        {"dwords of every alignment", BdaLaneStore::Dword, 0x1001u, 0u, ~0ull},
+        {"runtime dwords of every alignment", BdaLaneStore::RuntimeDword, 0x1001u, 0u, ~0ull},
+        {"aligned runtime dwords of all lanes in one page", BdaLaneStore::RuntimeDword, 16u, 0u, ~0ull},
     }};
     Buffer fault(context, Abi::FaultBufferBytes, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT);
     Buffer output(context, 4, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT);
@@ -1039,12 +1100,13 @@ void RunBdaStoreExecutionTests(const Context& context) {
     bool runtime = false;
     bool paged = false;
     bool enabled = true;
+    std::uint32_t extraCount = 0;
     const auto run = [&](const char* name, std::uint64_t address, std::uint32_t bits, bool coherent, const std::array<std::uint8_t, 5>& expected, std::initializer_list<std::uint64_t> writtenAddresses, Abi::FaultReason reason = {}, std::uint64_t faultAddress = 0, std::uint32_t faultBytes = 0) {
         const std::string label = std::string(runtime ? "BDA runtime write " : "BDA store ") + name + (coherent ? " coherent" : "") + (paged ? " paged: " : ": ");
         std::memset(first.Bytes().data(), 0xcd, first.Bytes().size());
         std::memset(second.Bytes().data(), 0xcd, second.Bytes().size());
         const auto pages = PagesFor(context, paged, ranges);
-        const auto table = MakeBinding(context, paged, pages, ranges, grants);
+        const auto table = MakeBinding(context, paged, pages, ranges, grants, extraCount);
         std::memset(fault.Bytes().data(), 0, fault.Bytes().size());
         std::memset(output.Bytes().data(), 0, output.Bytes().size());
         Pipeline pipeline(context, runtime ? MakeBdaWriteTestShader(address, 0xa1b2c3d4u, bits, coherent, enabled) : MakeBdaStoreTestShader(address, 0xa1b2c3d4u, bits, coherent), {table.get(), &fault, &output});
@@ -1094,6 +1156,17 @@ void RunBdaStoreExecutionTests(const Context& context) {
             run("disabled byte", guest + 1, 8, coherent, {0xcd, 0xcd, 0xcd, 0xcd, 0xcd}, {});
             enabled = true;
         }
+        constexpr auto top = std::numeric_limits<std::uint64_t>::max();
+        if (runtime) {
+            run("short past the top", top, 16, coherent, {0xcd, 0xcd, 0xcd, 0xcd, 0xcd}, {}, Abi::FaultReason::Overflow, top, 2);
+            run("unaligned dword past the top", top - 2u, 32, coherent, {0xcd, 0xcd, 0xcd, 0xcd, 0xcd}, {}, Abi::FaultReason::Overflow, top - 2u, 4);
+        } else {
+            run("unaligned dword past the top", top - 2u, 32, coherent, {0xcd, 0xcd, 0xcd, 0xcd, 0xcd}, {}, Abi::FaultReason::Unmapped, top - 2u, 1);
+        }
+        run("aligned dword at the top", top - 3u, 32, coherent, {0xcd, 0xcd, 0xcd, 0xcd, 0xcd}, {}, Abi::FaultReason::Overflow, top - 3u, 4);
+        extraCount = 1;
+        run("aligned dword at the top of an invalid table", top - 3u, 32, coherent, {0xcd, 0xcd, 0xcd, 0xcd, 0xcd}, {}, Abi::FaultReason::InvalidTable, top - 3u, 4);
+        extraCount = 0;
         ranges[1].permissions = Abi::Read;
         run("read-only byte", guest + 2, 8, coherent, {0xcd, 0xcd, 0xcd, 0xcd, 0xcd}, {}, Abi::FaultReason::Permission, guest + 2, 1);
         run("read-only short suffix", guest + 1, 16, coherent, {0xcd, 0xd4, 0xcd, 0xcd, 0xcd}, {guest + 1}, Abi::FaultReason::Permission, guest + 2, 1);

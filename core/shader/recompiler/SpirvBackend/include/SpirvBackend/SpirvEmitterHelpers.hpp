@@ -183,6 +183,31 @@ void EmitIfCondition(SpirvEmitterState& state, std::uint32_t condition, TFunctio
     EmitLabel(state, mergeLabel);
 }
 
+template<typename TBody>
+void EmitCountedLoop(SpirvEmitterState& state, std::uint32_t count, TBody&& body) {
+    const auto u32 = TypeU32(state);
+    const auto entry = state.currentLabel;
+    const auto header = state.module.AllocateId();
+    const auto bodyLabel = state.module.AllocateId();
+    const auto continuation = state.module.AllocateId();
+    const auto merge = state.module.AllocateId();
+    const auto index = state.module.AllocateId();
+    const auto next = state.module.AllocateId();
+    state.module.AddFunction(spv::OpBranch, header);
+    EmitLabel(state, header);
+    state.module.AddFunction(spv::OpPhi, u32, index, ConstantU32(state, 0u), entry, next, continuation);
+    const auto pending = Binary(state, spv::OpULessThan, TypeBool(state), index, count);
+    state.module.AddFunction(spv::OpLoopMerge, merge, continuation, spv::LoopControlDontUnrollMask);
+    state.module.AddFunction(spv::OpBranchConditional, pending, bodyLabel, merge);
+    EmitLabel(state, bodyLabel);
+    body(index);
+    state.module.AddFunction(spv::OpBranch, continuation);
+    EmitLabel(state, continuation);
+    state.module.AddFunction(spv::OpIAdd, u32, next, index, ConstantU32(state, 1u));
+    state.module.AddFunction(spv::OpBranch, header);
+    EmitLabel(state, merge);
+}
+
 template<typename TFunction>
 std::array<std::uint32_t, 4> EmitValuesOrDefaultIfCondition(SpirvEmitterState& state, std::uint32_t condition, std::uint32_t type, std::uint32_t defaultValue, std::uint32_t count, TFunction&& function) {
     const auto header = state.currentLabel;

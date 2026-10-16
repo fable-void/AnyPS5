@@ -681,6 +681,7 @@ CompiledVariant compileVariant(const RecompileRequest& request, IrProgram progra
     targetOptions.registrationModules = registration;
     targetOptions.fragmentDescriptorSet = request.target.registrationModules;
     targetOptions.float16DenormPreserve = request.target.float16DenormPreserve;
+    targetOptions.bdaRangeList = request.target.bdaRangeList;
 
     ShaderStageInputInfo emitInputInfo = inputInfo;
     ShaderComputeInputInfo oneLaneCompute{};

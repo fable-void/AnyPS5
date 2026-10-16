@@ -80,6 +80,7 @@ std::vector<std::uint32_t> MakeShader(std::uint64_t address, bool coherent, bool
     }
     const auto values = emit(ctx, instruction, base);
     for (std::uint32_t index = 0; index < values.size(); ++index) state.module.AddFunction(spv::OpStore, BdaWord(state, output, ConstantU32(state, index)), values[index]);
+    FlushBdaFault(state);
     state.module.AddFunction(spv::OpReturn);
     state.module.AddFunction(spv::OpFunctionEnd);
     state.module.AddExecutionMode(main, spv::ExecutionModeLocalSize, 1u, 1u, 1u);
@@ -87,9 +88,8 @@ std::vector<std::uint32_t> MakeShader(std::uint64_t address, bool coherent, bool
     return Structured(state.module.Finalize());
 }
 
-}
-
-std::vector<std::uint32_t> MakeBdaTranslateTestShader(std::uint32_t count) {
+template<typename TEmit>
+std::vector<std::uint32_t> MakeProbeShader(std::uint32_t count, const TEmit& emit) {
     using namespace ShaderRecompiler;
     IrProgram program;
     program.Resources().stage = IrShaderStage::Compute;
@@ -112,13 +112,27 @@ std::vector<std::uint32_t> MakeBdaTranslateTestShader(std::uint32_t count) {
     const auto main = state.module.AllocateId();
     state.module.AddFunction(spv::OpFunction, TypeVoid(state), main, spv::FunctionControlMaskNone, TypeFunction(state));
     EmitLabel(state, state.module.AllocateId());
-    const auto u32 = TypeU32(state);
-    const auto u64 = TypeScalarU64(state);
     const auto ids = state.module.AllocateId();
     state.module.AddFunction(spv::OpLoad, TypeU32Vector(state, 3), ids, invocation);
     const auto index = state.module.AllocateId();
-    state.module.AddFunction(spv::OpCompositeExtract, u32, index, ids, 0u);
-    EmitIfCondition(state, Binary(state, spv::OpULessThan, TypeBool(state), index, ConstantU32(state, count)), [&] {
+    state.module.AddFunction(spv::OpCompositeExtract, TypeU32(state), index, ids, 0u);
+    EmitIfCondition(state, Binary(state, spv::OpULessThan, TypeBool(state), index, ConstantU32(state, count)), [&] { emit(state, io, index); });
+    FlushBdaFault(state);
+    state.module.AddFunction(spv::OpReturn);
+    state.module.AddFunction(spv::OpFunctionEnd);
+    state.module.AddExecutionMode(main, spv::ExecutionModeLocalSize, 64u, 1u, 1u);
+    state.module.EmitEntryPoint(spv::ExecutionModelGLCompute, main, "main", std::vector<std::uint32_t>{invocation});
+    return Structured(state.module.Finalize());
+}
+
+}
+
+std::vector<std::uint32_t> MakeBdaTranslateTestShader(std::uint32_t count) {
+    using namespace ShaderRecompiler;
+    return MakeProbeShader(count, [&](SpirvEmitterState& state, std::uint32_t io, std::uint32_t index) {
+        if (state.bdaWriteTranslateFunction == 0u) throw std::runtime_error("the BDA write translate function was not defined");
+        const auto u32 = TypeU32(state);
+        const auto u64 = TypeScalarU64(state);
         const auto word = [&](std::uint32_t at) { return Binary(state, spv::OpIAdd, u32, Binary(state, spv::OpShiftLeftLogical, u32, index, ConstantU32(state, 2u)), ConstantU32(state, at)); };
         const auto load = [&](std::uint32_t at) {
             const auto value = state.module.AllocateId();
@@ -126,8 +140,15 @@ std::vector<std::uint32_t> MakeBdaTranslateTestShader(std::uint32_t count) {
             return value;
         };
         const auto address = Binary(state, spv::OpBitwiseOr, u64, Unary(state, spv::OpUConvert, u64, load(0u)), Binary(state, spv::OpShiftLeftLogical, u64, Unary(state, spv::OpUConvert, u64, load(1u)), BdaConstant(state, 32u)));
-        const auto translated = state.module.AllocateId();
-        state.module.AddFunction(spv::OpFunctionCall, state.module.Type(spv::OpTypeStruct, u64, u32), translated, state.bdaTranslateFunction, address, load(2u), load(3u));
+        const auto bytes = load(2u);
+        const auto permission = load(3u);
+        const auto translation = state.module.Type(spv::OpTypeStruct, u64, u32);
+        const auto translate = [&](std::uint32_t function) {
+            const auto value = state.module.AllocateId();
+            state.module.AddFunction(spv::OpFunctionCall, translation, value, function, address, bytes, permission);
+            return value;
+        };
+        const auto translated = EmitValueIfElse(state, Binary(state, spv::OpIEqual, TypeBool(state), permission, ConstantU32(state, BdaAbi::Read)), translation, [&] { return translate(state.bdaTranslateFunction); }, [&] { return translate(state.bdaWriteTranslateFunction); });
         const auto device = state.module.AllocateId();
         state.module.AddFunction(spv::OpCompositeExtract, u64, device, translated, 0u);
         const auto reason = state.module.AllocateId();
@@ -137,11 +158,30 @@ std::vector<std::uint32_t> MakeBdaTranslateTestShader(std::uint32_t count) {
         state.module.AddFunction(spv::OpStore, BdaWord(state, io, word(results + 1u)), Unary(state, spv::OpUConvert, u32, Binary(state, spv::OpShiftRightLogical, u64, device, BdaConstant(state, 32u))));
         state.module.AddFunction(spv::OpStore, BdaWord(state, io, word(results + 2u)), reason);
     });
-    state.module.AddFunction(spv::OpReturn);
-    state.module.AddFunction(spv::OpFunctionEnd);
-    state.module.AddExecutionMode(main, spv::ExecutionModeLocalSize, 64u, 1u, 1u);
-    state.module.EmitEntryPoint(spv::ExecutionModelGLCompute, main, "main", std::vector<std::uint32_t>{invocation});
-    return Structured(state.module.Finalize());
+}
+
+std::vector<std::uint32_t> MakeBdaSegmentTestShader(std::uint32_t count) {
+    using namespace ShaderRecompiler;
+    return MakeProbeShader(count, [&](SpirvEmitterState& state, std::uint32_t io, std::uint32_t index) {
+        if (state.bdaSegmentFunction == 0u) throw std::runtime_error("the BDA segment function was not defined");
+        const auto u32 = TypeU32(state);
+        const auto u64 = TypeScalarU64(state);
+        const auto word = [&](std::uint32_t at) { return Binary(state, spv::OpIAdd, u32, Binary(state, spv::OpShiftLeftLogical, u32, index, ConstantU32(state, 3u)), ConstantU32(state, at)); };
+        const auto load = [&](std::uint32_t at) {
+            const auto value = state.module.AllocateId();
+            state.module.AddFunction(spv::OpLoad, u32, value, BdaWord(state, io, word(at)));
+            return value;
+        };
+        const auto address = Binary(state, spv::OpBitwiseOr, u64, Unary(state, spv::OpUConvert, u64, load(0u)), Binary(state, spv::OpShiftLeftLogical, u64, Unary(state, spv::OpUConvert, u64, load(1u)), BdaConstant(state, 32u)));
+        const auto segment = state.module.AllocateId();
+        state.module.AddFunction(spv::OpFunctionCall, state.module.Type(spv::OpTypeStruct, u64, u64, u64), segment, state.bdaSegmentFunction, address);
+        for (std::uint32_t field = 0; field < 3u; ++field) {
+            const auto value = state.module.AllocateId();
+            state.module.AddFunction(spv::OpCompositeExtract, u64, value, segment, field);
+            state.module.AddFunction(spv::OpStore, BdaWord(state, io, word(2u + 2u * field)), Unary(state, spv::OpUConvert, u32, value));
+            state.module.AddFunction(spv::OpStore, BdaWord(state, io, word(3u + 2u * field)), Unary(state, spv::OpUConvert, u32, Binary(state, spv::OpShiftRightLogical, u64, value, BdaConstant(state, 32u))));
+        }
+    });
 }
 
 std::vector<std::uint32_t> MakeBdaTestShader(std::uint64_t address, std::uint32_t bits, std::int64_t offset) {
@@ -152,17 +192,34 @@ std::vector<std::uint32_t> MakeBdaTestShader(std::uint64_t address, std::uint32_
     });
 }
 
+std::vector<std::uint32_t> MakeBdaHeldFaultTestShader(std::uint64_t heldAddress, std::uint32_t heldBytes, std::uint32_t heldPc, std::uint64_t address, std::uint32_t bits) {
+    using namespace ShaderRecompiler;
+    auto shader = MakeShader(address, false, true, [&](SpirvValueEmitContext& ctx, const IrValue& instruction, std::uint32_t base) {
+        auto& state = ctx.state;
+        RecordBdaFault(state, BdaConstant(state, heldAddress), ConstantU32(state, heldBytes), ConstantU32(state, heldPc), BdaAbi::FaultReason::Unmapped);
+        return std::vector<std::uint32_t>{EmitBdaRead(ctx, instruction, base, bits)};
+    });
+#if ANYPS5_ENABLE_SPIRV_TOOLS
+    shader = ValidateAndOptimizeSpirv(shader, VK_API_VERSION_1_1, shader[1], false, false);
+#endif
+    return shader;
+}
+
 std::vector<std::uint32_t> MakeBdaSpanReadTestShader(std::uint64_t address, std::uint32_t offset, std::uint32_t extracted, bool coherent, bool stops) {
     using namespace ShaderRecompiler;
-    return MakeShader(address, coherent, stops, [&](SpirvValueEmitContext& ctx, const IrValue& instruction, std::uint32_t base) {
+    auto shader = MakeShader(address, coherent, stops, [&](SpirvValueEmitContext& ctx, const IrValue& instruction, std::uint32_t base) {
         const auto values = EmitBdaDwordReads(ctx, instruction, base, offset, 4u);
         return std::vector<std::uint32_t>(values.begin(), values.end());
     }, extracted);
+#if ANYPS5_ENABLE_SPIRV_TOOLS
+    shader = ValidateAndOptimizeSpirv(shader, VK_API_VERSION_1_1, shader[1], false, false);
+#endif
+    return shader;
 }
 
 std::vector<std::uint32_t> MakeBdaCachedReadTestShader(const std::vector<BdaCachedRead>& reads) {
     using namespace ShaderRecompiler;
-    return MakeShader(0u, false, false, [&](SpirvValueEmitContext& ctx, const IrValue& instruction, std::uint32_t) {
+    auto shader = MakeShader(0u, false, false, [&](SpirvValueEmitContext& ctx, const IrValue& instruction, std::uint32_t) {
         auto& state = ctx.state;
         const auto vector = TypeU32Vector(state, 4);
         std::vector<std::uint32_t> values;
@@ -190,6 +247,10 @@ std::vector<std::uint32_t> MakeBdaCachedReadTestShader(const std::vector<BdaCach
         }
         return values;
     });
+#if ANYPS5_ENABLE_SPIRV_TOOLS
+    shader = ValidateAndOptimizeSpirv(shader, VK_API_VERSION_1_1, shader[1], false, false);
+#endif
+    return shader;
 }
 
 std::vector<std::uint32_t> MakeBdaDwordWriteTestShader(std::uint64_t address, std::uint32_t dwords, const std::uint32_t* values) {
@@ -209,10 +270,14 @@ std::vector<std::uint32_t> MakeBdaDwordWriteTestShader(std::uint64_t address, st
 
 std::vector<std::uint32_t> MakeBdaDwordReadTestShader(std::uint64_t address, std::uint32_t dwords, bool coherent, bool stops) {
     using namespace ShaderRecompiler;
-    return MakeShader(address, coherent, stops, [&](SpirvValueEmitContext& ctx, const IrValue& instruction, std::uint32_t base) {
+    auto shader = MakeShader(address, coherent, stops, [&](SpirvValueEmitContext& ctx, const IrValue& instruction, std::uint32_t base) {
         const auto values = EmitBdaDwordReads(ctx, instruction, base, 0u, dwords, true);
         return std::vector<std::uint32_t>(values.begin(), values.begin() + dwords);
     });
+#if ANYPS5_ENABLE_SPIRV_TOOLS
+    shader = ValidateAndOptimizeSpirv(shader, VK_API_VERSION_1_1, shader[1], false, false);
+#endif
+    return shader;
 }
 
 std::vector<std::uint32_t> MakeBdaStoreTestShader(std::uint64_t address, std::uint32_t value, std::uint32_t bits, bool coherent) {
@@ -287,6 +352,7 @@ std::vector<std::uint32_t> MakeBdaLaneStoreTestShader(std::uint64_t address, std
                 break;
         }
     });
+    FlushBdaFault(state);
     state.module.AddFunction(spv::OpReturn);
     state.module.AddFunction(spv::OpFunctionEnd);
     state.module.AddExecutionMode(main, spv::ExecutionModeLocalSize, 64u, 1u, 1u);

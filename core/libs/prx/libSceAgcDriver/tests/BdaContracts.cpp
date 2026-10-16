@@ -60,4 +60,15 @@ void RunBdaContractTests() {
     invalid[0] = invalid[0] == 'A' ? 'B' : 'A';
     reject([&] { static_cast<void>(serializer.Deserialize(invalid)); }, "request signature");
     reject([&] { static_cast<void>(serializer.Deserialize("NVNQQWMAAAA=")); }, "serialization version");
+    for (const bool stops : {true, false}) {
+        for (const bool coherent : {false, true}) {
+            static_cast<void>(MakeBdaSpanReadTestShader(0x7fff56780000ull, 4u, 0b0101u, coherent, stops));
+            static_cast<void>(MakeBdaDwordReadTestShader(0x7fff12340001ull, 1u, coherent, stops));
+            static_cast<void>(MakeBdaDwordReadTestShader(0x7fff12340001ull, 4u, coherent, stops));
+        }
+    }
+    static_cast<void>(MakeBdaCachedReadTestShader({{0x7fff12340000ull, 1u}, {0x7fff12340004ull, 3u}}));
+    static_cast<void>(MakeBdaHeldFaultTestShader(0x7fff12340041ull, 2u, 0x5678u, 0x7fff12340000ull, 8u));
+    static_cast<void>(MakeBdaHeldFaultTestShader(0x7fff12340041ull, 2u, 0x5678u, ~0ull - 1u, 32u));
+    if (!BdaByteReadsForced()) static_cast<void>(MakeBdaSegmentTestShader(1u));
 }

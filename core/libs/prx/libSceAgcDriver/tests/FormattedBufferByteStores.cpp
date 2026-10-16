@@ -1,5 +1,6 @@
 #include "BdaAbi.hpp"
 #include "Recompiler.hpp"
+#include <algorithm>
 #include <array>
 #include <cstdio>
 #include <exception>
@@ -37,6 +38,7 @@ struct Counts {
     std::size_t storeCompareExchanges = 0;
     std::map<std::string, std::size_t> byteStores;
     std::map<std::string, std::size_t> volatileByteStores;
+    std::map<std::string, std::size_t> writeCalls;
     std::map<std::string, std::size_t> byteWriteCalls;
     std::map<std::string, std::set<std::string>> calls;
     bool byteCapability = false;
@@ -51,6 +53,7 @@ Counts Count(std::span<const std::uint32_t> words) {
     std::set<std::uint32_t> bytePointers;
     std::set<std::uint32_t> wordTypes;
     std::set<std::uint32_t> ones;
+    std::map<std::uint32_t, std::set<std::uint32_t>> phis;
     std::string function;
     for (std::size_t offset = 5; offset < words.size();) {
         const auto count = words[offset] >> spv::WordCountShift;
@@ -70,10 +73,18 @@ Counts Count(std::span<const std::uint32_t> words) {
             ++counts.byteStores[function];
             if (count > 3 && (operands[2] & spv::MemoryAccessVolatileMask) != 0u) ++counts.volatileByteStores[function];
         }
+        if (opcode == spv::OpPhi) {
+            for (std::uint32_t operand = 2; operand + 2u < count; operand += 2u) phis[operands[1]].insert(operands[operand]);
+        }
         if (opcode == spv::OpFunctionCall) {
             const auto callee = names[operands[2]];
             counts.calls[function].insert(callee);
-            if ((callee == "write_bda" || callee == "write_bda_coherent") && count > 6u && ones.contains(operands[5])) ++counts.byteWriteCalls[callee];
+            if ((callee == "write_bda" || callee == "write_bda_coherent") && count > 6u) {
+                ++counts.writeCalls[callee];
+                const auto bytes = phis.find(operands[5]);
+                const bool oneByte = ones.contains(operands[5]) || (bytes != phis.end() && std::any_of(bytes->second.begin(), bytes->second.end(), [&](std::uint32_t value) { return ones.contains(value); }));
+                if (oneByte) ++counts.byteWriteCalls[callee];
+            }
         }
         offset += count;
     }
@@ -107,10 +118,10 @@ int main() {
             const std::string stage = "compute";
             auto bytes = Count(Recompiled(true, false));
             Check(bytes.storeCompareExchanges == 0, "formatted buffer byte stores: a " + stage + " store patches its dword with " + std::to_string(bytes.storeCompareExchanges) + " compare-exchange loops");
-            Check(bytes.byteCapability && bytes.byteWriteCalls["write_bda"] >= 4, "formatted buffer byte stores: the 8-bit components of a " + stage + " store make " + std::to_string(bytes.byteWriteCalls["write_bda"]) + " one-byte writes, expected at least 4");
+            Check(bytes.byteCapability && bytes.writeCalls["write_bda"] == 1 && bytes.byteWriteCalls["write_bda"] == 1, "formatted buffer byte stores: a " + stage + " store calls write_bda at " + std::to_string(bytes.writeCalls["write_bda"]) + " sites, " + std::to_string(bytes.byteWriteCalls["write_bda"]) + " of them able to write one-byte components, expected one call that writes every component, 8-bit ones included");
             Check(bytes.calls["write_bda"].contains("write_bda_bytes") && bytes.byteStores["write_bda_bytes"] >= 1, "formatted buffer byte stores: a one-byte write of a " + stage + " store does not reach a store through a physical byte pointer");
             auto coherent = Count(Recompiled(true, true));
-            Check(coherent.storeCompareExchanges == 0 && coherent.byteWriteCalls["write_bda_coherent"] >= 4, "formatted buffer byte stores: the 8-bit components of a glc " + stage + " store make " + std::to_string(coherent.byteWriteCalls["write_bda_coherent"]) + " coherent one-byte writes (" + std::to_string(coherent.storeCompareExchanges) + " compare-exchange loops), expected at least 4");
+            Check(coherent.storeCompareExchanges == 0 && coherent.writeCalls["write_bda_coherent"] == 1 && coherent.byteWriteCalls["write_bda_coherent"] == 1, "formatted buffer byte stores: a glc " + stage + " store calls write_bda_coherent at " + std::to_string(coherent.writeCalls["write_bda_coherent"]) + " sites, " + std::to_string(coherent.byteWriteCalls["write_bda_coherent"]) + " of them able to write one-byte components (" + std::to_string(coherent.storeCompareExchanges) + " compare-exchange loops), expected one call that writes every component, 8-bit ones included");
             Check(coherent.calls["write_bda_coherent"].contains("write_bda_bytes_coherent") && coherent.volatileByteStores["write_bda_bytes_coherent"] >= 1, "formatted buffer byte stores: a glc " + stage + " store does not store its bytes as volatile byte stores");
         }
         bool rejected = false;
